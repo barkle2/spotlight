@@ -10,7 +10,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=["pynput", "pynput.keyboard", "pynput.mouse"],
     noarchive=False,
     optimize=0,
 )
