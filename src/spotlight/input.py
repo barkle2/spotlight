@@ -4,6 +4,7 @@ import ctypes
 from ctypes import wintypes
 
 from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QWidget
 
 
@@ -15,12 +16,12 @@ WM_INPUT = 0x00FF
 RID_INPUT = 0x10000003
 RIM_TYPEMOUSE = 0
 RI_MOUSE_LEFT_BUTTON_DOWN = 0x0001
-RI_MOUSE_LEFT_BUTTON_UP = 0x0002
 RI_MOUSE_RIGHT_BUTTON_DOWN = 0x0004
-RI_MOUSE_RIGHT_BUTTON_UP = 0x0008
 RI_MOUSE_WHEEL = 0x0400
-RI_MOUSE_HWHEEL = 0x0800
 WHEEL_DELTA = 120
+
+# 참고: 버튼 UP(0x0002/0x0008)과 수평 휠(RI_MOUSE_HWHEEL, 0x0800)은
+# 시각 이펙트 대상이 아니므로 구독하지 않는다. 미사용 상수는 정의하지 않는다.
 
 
 class RAWINPUTDEVICE(ctypes.Structure):
@@ -57,6 +58,8 @@ class _RAWBUTTONUNION(ctypes.Union):
 
 
 class RAWMOUSE(ctypes.Structure):
+    # usFlags 뒤 정렬 패딩 2바이트는 ctypes 기본 정렬이 처리한다.
+    # _pack_ 을 지정하면 구조가 어긋나므로 지정하지 않는다.
     _anonymous_ = ("button_data",)
     _fields_ = (
         ("usFlags", wintypes.USHORT),
@@ -81,6 +84,8 @@ class RAWINPUT(ctypes.Structure):
 
 
 class _RawInputWidget(QWidget):
+    """WM_INPUT 수신 전용 숨김 창."""
+
     def __init__(self, mouse_input: GlobalMouseInput) -> None:
         super().__init__()
         self.mouse_input = mouse_input
@@ -88,11 +93,14 @@ class _RawInputWidget(QWidget):
 
     def nativeEvent(self, event_type, message: int) -> tuple[bool, int]:
         if event_type == b"windows_generic_MSG":
-            native_message = ctypes.cast(
-                int(message), ctypes.POINTER(wintypes.MSG)
-            ).contents
-            if native_message.message == WM_INPUT:
-                self.mouse_input._handle_raw_input(native_message.lParam)
+            # 이 경로는 모든 네이티브 메시지가 통과한다. 예외가 Qt 디스패처로
+            # 전파되면 이벤트 루프가 불안정해지므로 여기서 차단하고 계수만 남긴다.
+            try:
+                native_message = wintypes.MSG.from_address(int(message))
+                if native_message.message == WM_INPUT:
+                    self.mouse_input._handle_raw_input(native_message.lParam)
+            except Exception:
+                self.mouse_input.error_count += 1
         return False, 0
 
 
@@ -104,6 +112,8 @@ class GlobalMouseInput(QObject):
         super().__init__()
         self.widget: _RawInputWidget | None = None
         self.started = False
+        self.error_count = 0
+        self._wheel_residual = 0
         self._user32 = ctypes.WinDLL("user32", use_last_error=True)
         self._user32.RegisterRawInputDevices.argtypes = (
             ctypes.POINTER(RAWINPUTDEVICE),
@@ -119,12 +129,11 @@ class GlobalMouseInput(QObject):
             wintypes.UINT,
         )
         self._user32.GetRawInputData.restype = wintypes.UINT
-        self._user32.GetCursorPos.argtypes = (ctypes.POINTER(wintypes.POINT),)
-        self._user32.GetCursorPos.restype = wintypes.BOOL
 
     def start(self) -> None:
         if self.started:
             return
+        self._wheel_residual = 0
         self.widget = _RawInputWidget(self)
         hwnd = int(self.widget.winId())
         device = RAWINPUTDEVICE(
@@ -144,6 +153,7 @@ class GlobalMouseInput(QObject):
         self.started = True
 
     def stop(self) -> bool:
+        self._wheel_residual = 0
         if self.widget is None:
             self.started = False
             return True
@@ -188,14 +198,23 @@ class GlobalMouseInput(QObject):
         flags = raw_input.mouse.usButtonFlags
         if not flags:
             return
-        point = wintypes.POINT()
-        if not self._user32.GetCursorPos(ctypes.byref(point)):
-            return
+
+        # 좌표는 Qt 논리 좌표로 취득한다. GetCursorPos는 물리 픽셀을 돌려주므로
+        # 논리 좌표를 쓰는 오버레이(geometry/QCursor.pos)와 고DPI에서 어긋난다.
+        position = QCursor.pos()
+        x, y = position.x(), position.y()
+
         if flags & RI_MOUSE_LEFT_BUTTON_DOWN:
-            self.clicked.emit(point.x, point.y, "left")
+            self.clicked.emit(x, y, "left")
         if flags & RI_MOUSE_RIGHT_BUTTON_DOWN:
-            self.clicked.emit(point.x, point.y, "right")
+            self.clicked.emit(x, y, "right")
         if flags & RI_MOUSE_WHEEL:
             delta = ctypes.c_short(raw_input.mouse.usButtonData).value
             if delta:
-                self.scrolled.emit(point.x, point.y, int(delta / WHEEL_DELTA))
+                # 고해상도 휠은 120 미만 델타를 보낸다. 잔여분을 누적해
+                # 노치가 찰 때만 발신하여 이벤트 소실을 막는다.
+                self._wheel_residual += delta
+                notches = int(self._wheel_residual / WHEEL_DELTA)
+                if notches:
+                    self._wheel_residual -= notches * WHEEL_DELTA
+                    self.scrolled.emit(x, y, notches)

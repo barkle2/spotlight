@@ -80,7 +80,7 @@ def make_exe(variant):
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
-        upx=True,
+        upx=False,
         upx_exclude=[],
         runtime_tmpdir=None,
         console=False,
@@ -90,6 +90,7 @@ def make_exe(variant):
         codesign_identity=None,
         entitlements_file=None,
         icon=[str(PROJECT_ROOT / "assets" / "spotlight.ico")],
+	version=str(PROJECT_ROOT / "packaging" / "version_info.py"),
     )
 
 

@@ -59,10 +59,36 @@ class SpotlightOverlay(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self._set_virtual_geometry()
+        self._connect_screen_signals()
 
         self.timer = QTimer(self)
         self.timer.setInterval(16)
         self.timer.timeout.connect(self._tick)
+
+    def _connect_screen_signals(self) -> None:
+        """모니터 구성 변경을 구독한다.
+
+        도킹/해제, 해상도 변경, 모니터 추가 시 가상 데스크톱 영역이 바뀌므로
+        생성 시점의 geometry를 그대로 두면 오버레이가 화면을 덮지 못한다.
+        """
+        application = QApplication.instance()
+        if application is not None:
+            application.screenAdded.connect(self._on_screen_added)
+            application.screenRemoved.connect(self._on_screens_changed)
+        for screen in QApplication.screens():
+            self._connect_screen(screen)
+
+    def _connect_screen(self, screen) -> None:
+        screen.geometryChanged.connect(self._on_screens_changed)
+        screen.logicalDotsPerInchChanged.connect(self._on_screens_changed)
+
+    def _on_screen_added(self, screen) -> None:
+        self._connect_screen(screen)
+        self._on_screens_changed()
+
+    def _on_screens_changed(self, *_) -> None:
+        self._set_virtual_geometry()
+        self.update()
 
     def _set_virtual_geometry(self) -> None:
         screens = QApplication.screens()
@@ -92,7 +118,9 @@ class SpotlightOverlay(QWidget):
         self.spotlight = spotlight
         self.click = click
         self.wheel = wheel
-        self.start()
+        # 정지 상태에서 설정만 바뀐 경우 다시 표시하지 않는다.
+        if self.timer.isActive() or self.isVisible():
+            self.start()
         self.update()
 
     def _tick(self) -> None:

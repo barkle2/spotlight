@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import signal
 import sys
+from ctypes import wintypes
 from pathlib import Path
 
 from PySide6.QtCore import QCoreApplication, Qt, QTimer
@@ -15,6 +17,39 @@ from .input import GlobalMouseInput
 from .overlay import SpotlightOverlay
 from .settings_dialog import SettingsDialog
 from .tray import SpotlightTray
+
+
+ERROR_ALREADY_EXISTS = 183
+SINGLE_INSTANCE_NAME = "Local\\Spotlight.SingleInstance"
+POINTER_PREVIEW_DEBOUNCE_MS = 150
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+_kernel32.CreateMutexW.restype = wintypes.HANDLE
+_kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+_kernel32.CloseHandle.restype = wintypes.BOOL
+
+
+def acquire_single_instance() -> int | None:
+    """세션당 1개 인스턴스만 허용한다. 획득 실패 시 None.
+
+    시스템 커서는 세션 전역 자원이라 여러 인스턴스가 조율 없이 조작하면
+    복구 마커를 서로 지워 자동 복구가 무력화된다.
+    'Local\\' 접두사로 세션 단위 범위를 지정한다. 'Global\\'을 쓰면
+    다중 사용자 세션에서 서로를 차단해 잘못된 동작이 된다.
+    """
+    handle = _kernel32.CreateMutexW(None, True, SINGLE_INSTANCE_NAME)
+    if not handle:
+        return None
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        _kernel32.CloseHandle(handle)
+        return None
+    return int(handle)
+
+
+def release_single_instance(handle: int | None) -> None:
+    if handle is not None:
+        _kernel32.CloseHandle(wintypes.HANDLE(handle))
 
 
 class SpotlightApplication:
@@ -39,6 +74,13 @@ class SpotlightApplication:
         self.settings_dialog: SettingsDialog | None = None
         self.tray = SpotlightTray(qt_app, self.open_settings)
         self._stopped = False
+        # 슬라이더 valueChanged에 apply()를 직결하면 1->15 드래그 시
+        # 커서 작업이 14종 x 14회 = 약 196회 연속 발생한다.
+        self._pending_preview: int | None = None
+        self._preview_timer = QTimer()
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(POINTER_PREVIEW_DEBOUNCE_MS)
+        self._preview_timer.timeout.connect(self._apply_pending_preview)
 
     def start(self) -> None:
         self.cursor_manager.apply(self.settings.pointer.size)
@@ -51,6 +93,8 @@ class SpotlightApplication:
         if self._stopped:
             return
         self._stopped = True
+        self._preview_timer.stop()
+        self._pending_preview = None
         self.input_stopped = self.mouse_input.stop()
         self.overlay.stop()
         self.tray.hide()
@@ -72,9 +116,29 @@ class SpotlightApplication:
     def _settings_closed(self) -> None:
         self.settings_dialog = None
 
-    def preview_pointer_size(self, size: int) -> None:
-        if self.cursor_manager.applied_level != size:
+    def preview_pointer_size(self, size: int, immediate: bool = False) -> None:
+        """포인터 크기 프리뷰. 기본은 디바운스, 취소 복원 시에는 즉시 적용."""
+        if immediate:
+            self._preview_timer.stop()
+            self._pending_preview = None
+            if self.cursor_manager.applied_level != size:
+                self.cursor_manager.apply(size)  # 예외는 호출자에게 전파
+            return
+        self._pending_preview = size
+        self._preview_timer.start()
+
+    def _apply_pending_preview(self) -> None:
+        size = self._pending_preview
+        self._pending_preview = None
+        if size is None or self.cursor_manager.applied_level == size:
+            return
+        try:
             self.cursor_manager.apply(size)
+        except Exception as exc:
+            dialog = self.settings_dialog
+            fallback = self.cursor_manager.applied_level or self.settings.pointer.size
+            if dialog is not None:
+                dialog.notify_preview_error(str(exc), fallback)
 
     def apply_settings(self, updated: Settings) -> None:
         previous = self.settings
@@ -103,6 +167,7 @@ class SpotlightApplication:
             "effects_max_active": self.overlay.max_active_effects,
             "effect_kind_counts": dict(self.overlay.effect_kind_counts),
             "input_listener_started": self.mouse_input.started,
+            "input_error_count": self.mouse_input.error_count,
             "cursor_count_applied": self.cursor_manager.applied_count,
             "active_cursor_image_size": active_cursor_image_size(),
             "overlay_visible": self.overlay.isVisible(),
@@ -125,14 +190,50 @@ class SpotlightApplication:
         }
 
 
+DEBUG_PATH_OPTIONS = ("report", "settings_path", "recovery_path")
+
+
+def local_path(value: str) -> Path:
+    """CLI로 받은 경로를 검증한다.
+
+    원격(UNC) 경로를 그대로 파일 조작에 넘기면 SMB 연결이 발생해
+    사용자 자격증명이 지정된 호스트로 전송된다. 로컬 경로만 허용한다.
+    """
+    text = value.strip().strip('"')
+    if not text:
+        raise argparse.ArgumentTypeError("경로가 비어 있습니다.")
+    if text.startswith("\\\\") or text.startswith("//"):
+        raise argparse.ArgumentTypeError("원격(UNC) 경로는 사용할 수 없습니다.")
+    path = Path(text)
+    if str(path.drive).startswith("\\\\"):
+        raise argparse.ArgumentTypeError("원격(UNC) 경로는 사용할 수 없습니다.")
+    return path
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Spotlight cursor highlighter")
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--settings-smoke-test", action="store_true")
-    parser.add_argument("--report", type=Path)
-    parser.add_argument("--settings-path", type=Path)
-    parser.add_argument("--recovery-path", type=Path)
-    return parser.parse_args(argv)
+    parser.add_argument("--report", type=local_path)
+    parser.add_argument("--settings-path", type=local_path)
+    parser.add_argument("--recovery-path", type=local_path)
+    args = parser.parse_args(argv)
+
+    # 경로 인자는 스모크 테스트 하네스 전용이다. 일반 실행에서 허용하면
+    # 임의 위치에 파일을 만들거나 덮어쓰는 통로가 되므로 함께 요구한다.
+    if not (args.smoke_test or args.settings_smoke_test):
+        used = [
+            name.replace("_", "-")
+            for name in DEBUG_PATH_OPTIONS
+            if getattr(args, name) is not None
+        ]
+        if used:
+            parser.error(
+                "--"
+                + ", --".join(used)
+                + " 은(는) --smoke-test 또는 --settings-smoke-test 와 함께만 사용할 수 있습니다."
+            )
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -150,6 +251,17 @@ def main(argv: list[str] | None = None) -> int:
     application: SpotlightApplication | None = None
     report: dict[str, object] = {}
     exit_code = 1
+
+    instance_lock = acquire_single_instance()
+    if instance_lock is None:
+        # 스모크 테스트는 CI 병렬 실행을 막지 않도록 계속 진행하되 사실을 남긴다.
+        if not smoke_test:
+            QMessageBox.information(
+                None, "Spotlight", "Spotlight가 이미 실행 중입니다."
+            )
+            return 0
+        report["single_instance_conflict"] = True
+
     try:
         application = SpotlightApplication(
             qt_app,
@@ -190,13 +302,27 @@ def main(argv: list[str] | None = None) -> int:
         if not smoke_test:
             QMessageBox.critical(None, "Spotlight 오류", str(exc))
     finally:
+        # stop()이 예외를 던지면 리포트 기록이 건너뛰어지고 원래 예외까지 가려진다.
+        # 정리 단계는 각각 독립적으로 보호한다.
         if application is not None:
-            application.stop()
-            report["cursor_restored"] = not application.cursor_manager.applied
-            report["recovery_file_exists"] = application.cursor_manager.recovery_file.exists()
+            try:
+                application.stop()
+            except Exception as exc:
+                report["stop_error"] = repr(exc)
+            try:
+                report["cursor_restored"] = not application.cursor_manager.applied
+                report["recovery_file_exists"] = (
+                    application.cursor_manager.recovery_file.exists()
+                )
+            except Exception as exc:
+                report["cursor_state_error"] = repr(exc)
+        release_single_instance(instance_lock)
         if args.report:
-            args.report.parent.mkdir(parents=True, exist_ok=True)
-            args.report.write_text(
-                json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            try:
+                args.report.parent.mkdir(parents=True, exist_ok=True)
+                args.report.write_text(
+                    json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            except OSError:
+                pass
     return exit_code

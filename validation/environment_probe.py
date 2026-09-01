@@ -15,12 +15,14 @@ def collect_environment() -> dict[str, object]:
     except Exception:
         pyside_version = None
 
+    # pynput은 v0.2.0에서 제거되었다(Raw Input API로 전환).
+    # 설치되어 있으면 과거 환경 잔재이므로 경고로만 보고한다.
     try:
-        import pynput
+        import pynput  # noqa: F401
 
-        pynput_version = getattr(pynput, "__version__", "installed")
+        pynput_present = True
     except Exception:
-        pynput_version = None
+        pynput_present = False
 
     return {
         "platform": platform.platform(),
@@ -28,7 +30,7 @@ def collect_environment() -> dict[str, object]:
         "python": sys.version.split()[0],
         "architecture": platform.machine(),
         "pyside6": pyside_version,
-        "pynput": pynput_version,
+        "pynput_present_unexpected": pynput_present,
         "local_app_data_available": bool(os.environ.get("LOCALAPPDATA")),
     }
 

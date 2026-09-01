@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import sys
+from pathlib import Path
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QColorDialog,
     QComboBox,
@@ -21,13 +26,40 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import (
+    __company__,
+    __copyright__,
+    __description__,
+    __original_filename__,
+    __product__,
+    __version__,
+)
 from .config import (
+    COLOR_PATTERN,
     ClickSettings,
     PointerSettings,
     Settings,
     SpotlightSettings,
     WheelSettings,
 )
+
+
+HASH_CHUNK_BYTES = 1024 * 1024
+
+
+def executable_path() -> Path | None:
+    """배포된 실행 파일 경로. 소스에서 실행 중이면 None."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable)
+    return None
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(HASH_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class ColorEditor(QWidget):
@@ -62,11 +94,7 @@ class ColorEditor(QWidget):
 
     def value(self) -> str:
         value = self.edit.text().strip().upper()
-        try:
-            valid = len(value) == 7 and value.startswith("#") and int(value[1:], 16) >= 0
-        except ValueError:
-            valid = False
-        if not valid:
+        if not COLOR_PATTERN.match(value):
             raise ValueError("색상은 #RRGGBB 형식이어야 합니다.")
         return value
 
@@ -86,6 +114,8 @@ class SettingsDialog(QDialog):
         self.on_apply = on_apply
         self.on_pointer_preview = on_pointer_preview
         self.applied_settings = settings
+        self.about_tab_index = -1
+        self.hash_computed = False
         self.setWindowTitle("Spotlight 설정")
         self.setMinimumWidth(460)
         self.tabs = QTabWidget()
@@ -93,6 +123,7 @@ class SettingsDialog(QDialog):
         self._build_spotlight_tab(settings)
         self._build_click_tab(settings)
         self._build_wheel_tab(settings)
+        self._build_about_tab()
 
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.Apply
@@ -131,12 +162,19 @@ class SettingsDialog(QDialog):
         try:
             self.on_pointer_preview(size)
         except Exception as exc:
-            previous_size = self.applied_settings.pointer.size
-            self.pointer_size.blockSignals(True)
-            self.pointer_size.setValue(previous_size)
-            self.pointer_size.blockSignals(False)
-            self.pointer_size_value.setText(str(previous_size))
-            QMessageBox.warning(self, "설정 오류", str(exc))
+            self.notify_preview_error(str(exc), self.applied_settings.pointer.size)
+
+    def notify_preview_error(self, message: str, fallback_size: int) -> None:
+        """프리뷰 적용 실패 통지.
+
+        포인터 프리뷰는 디바운스되어 슬라이더 콜백보다 늦게 실행되므로,
+        실패는 이 메서드를 통해 뒤늦게 전달된다. 슬라이더를 되돌린 뒤 알린다.
+        """
+        self.pointer_size.blockSignals(True)
+        self.pointer_size.setValue(fallback_size)
+        self.pointer_size.blockSignals(False)
+        self.pointer_size_value.setText(str(fallback_size))
+        QMessageBox.warning(self, "설정 오류", message)
 
     def _build_spotlight_tab(self, settings: Settings) -> None:
         page = QWidget()
@@ -202,6 +240,69 @@ class SettingsDialog(QDialog):
         form.addRow("선 두께", self.wheel_line_width)
         self.tabs.addTab(page, "휠")
 
+    def _build_about_tab(self) -> None:
+        """제품 정보 표시 전용 탭.
+
+        표시 항목은 packaging/version_info.py 의 VERSIONINFO 리소스와
+        동일한 값이며, src/spotlight/__init__.py 를 단일 출처로 사용한다.
+        """
+        page = QWidget()
+        form = QFormLayout(page)
+
+        title = QLabel(f"<b>{__product__}</b>")
+        form.addRow(title)
+
+        form.addRow("설명", QLabel(__description__))
+        form.addRow("버전", QLabel(__version__))
+        form.addRow("배포", QLabel(__company__))
+        form.addRow("파일명", QLabel(__original_filename__))
+
+        copyright_label = QLabel(__copyright__)
+        copyright_label.setWordWrap(True)
+        form.addRow("저작권", copyright_label)
+
+        # 해시는 64자 16진수이므로 등폭 글꼴로 줄바꿈해 표시한다.
+        # 클립보드 API를 사용하지 않고 텍스트 선택만 허용한다. 사용자는
+        # 선택 후 Ctrl+C 로 복사할 수 있고, 앱은 클립보드 권한을 갖지 않는다.
+        self.about_hash = QLabel(self._initial_hash_text())
+        self.about_hash.setWordWrap(True)
+        self.about_hash.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.about_hash.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
+        form.addRow("SHA-256", self.about_hash)
+
+        hash_note = QLabel("배포 시 공지된 해시와 대조해 파일 변조 여부를 확인할 수 있습니다.")
+        hash_note.setWordWrap(True)
+        form.addRow("", hash_note)
+
+        self.about_tab_index = self.tabs.count()
+        self.tabs.addTab(page, "정보")
+        # 다이얼로그 열기가 느려지지 않도록 정보 탭을 처음 열 때 계산한다.
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+    def _initial_hash_text(self) -> str:
+        return "정보 탭을 열면 계산합니다." if executable_path() else "실행 파일에서만 표시됩니다."
+
+    def _on_tab_changed(self, index: int) -> None:
+        if index == self.about_tab_index:
+            self.ensure_executable_hash()
+
+    def ensure_executable_hash(self) -> None:
+        """실행 파일 해시를 한 번만 계산해 표시한다."""
+        if self.hash_computed:
+            return
+        executable = executable_path()
+        if executable is None:
+            self.hash_computed = True
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self.about_hash.setText(file_sha256(executable))
+        except OSError as exc:
+            self.about_hash.setText(f"계산할 수 없습니다: {exc.strerror or exc}")
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.hash_computed = True
+
     def current_settings(self) -> Settings:
         return Settings(
             pointer=PointerSettings(size=self.pointer_size.value()),
@@ -243,7 +344,8 @@ class SettingsDialog(QDialog):
 
     def reject(self) -> None:
         try:
-            self.on_pointer_preview(self.applied_settings.pointer.size)
+            # 취소는 즉시 되돌려야 하므로 디바운스를 우회한다.
+            self.on_pointer_preview(self.applied_settings.pointer.size, immediate=True)
         except Exception as exc:
             QMessageBox.warning(self, "설정 오류", str(exc))
             return

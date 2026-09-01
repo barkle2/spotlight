@@ -79,6 +79,36 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("diameter=999", saved)
         self.assertNotIn("inner_diameter", saved)
         self.assertNotIn("outer_diameter", saved)
+    def _load_with_color(self, value: str):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.ini"
+            path.write_text(
+                DEFAULT_SETTINGS.replace("color=#FFFF00", f"color={value}"),
+                encoding="utf-8",
+            )
+            return load_settings(path)
+
+    def test_color_validation_rejects_int_literal_bypass(self) -> None:
+        """M-3: int(value, 16) 기반 검증이 허용하던 우회 입력을 차단한다.
+
+        Python 정수 리터럴 문법(언더스코어 구분자, 부호 접두, 0x 접두,
+        내부 공백)이 그대로 통과하던 문제를 정규식 검증으로 차단했다.
+        """
+        for value in ["#12_345", "#+12345", "#0x1234", "#  1234", "#GGGGGG", "#FFF"]:
+            with self.subTest(value=value):
+                settings = self._load_with_color(value)
+                self.assertEqual(settings.spotlight.color, "#FFFF00")
+
+    def test_color_validation_accepts_valid_values(self) -> None:
+        for value, expected in [
+            ("#FFFF00", "#FFFF00"),
+            ("#34c759", "#34C759"),
+            ("#000000", "#000000"),
+            ("#ffffff", "#FFFFFF"),
+        ]:
+            with self.subTest(value=value):
+                settings = self._load_with_color(value)
+                self.assertEqual(settings.spotlight.color, expected)
 
 
 if __name__ == "__main__":

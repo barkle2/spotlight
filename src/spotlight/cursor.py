@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import tempfile
 import time
 import winreg
 from ctypes import wintypes
@@ -14,6 +15,9 @@ LR_SHARED = 0x8000
 SPI_SETCURSORS = 0x0057
 SPIF_SENDCHANGE = 0x0002
 CURSOR_KEY = r"Control Panel\Cursors"
+ALLOWED_CURSOR_SUFFIXES = {".cur", ".ani"}
+RECOVERY_MARKER_SIGNATURE = "SPI_SETCURSORS"
+RECOVERY_MARKER_MAX_BYTES = 4096
 
 SYSTEM_CURSORS = {
     "Arrow": 32512,
@@ -141,6 +145,25 @@ def active_cursor_image_size() -> list[int] | None:
             gdi32.DeleteObject(icon.hbmColor)
 
 
+def is_recovery_marker(path: Path) -> bool:
+    """이 파일이 우리가 기록한 복구 마커인지 확인한다.
+
+    복구 마커 경로는 --recovery-path 로 지정될 수 있다. 내용을 확인하지 않고
+    지우면 존재하는 아무 파일이나 삭제하는 원시 기능이 되므로,
+    우리가 쓴 형식임을 확인한 경우에만 삭제한다.
+    """
+    try:
+        if path.stat().st_size > RECOVERY_MARKER_MAX_BYTES:
+            return False
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("restore_with") == RECOVERY_MARKER_SIGNATURE
+    )
+
+
 class CursorManager:
     def __init__(self, recovery_file: Path) -> None:
         self.recovery_file = recovery_file
@@ -148,21 +171,46 @@ class CursorManager:
         self.applied_level: int | None = None
         self.applied_count = 0
 
+    def _remove_recovery_marker(self) -> None:
+        """우리가 기록한 마커일 때만 삭제한다."""
+        if is_recovery_marker(self.recovery_file):
+            self.recovery_file.unlink(missing_ok=True)
+
     def recover_if_needed(self) -> bool:
-        if not self.recovery_file.exists():
+        # 형식이 맞지 않는 파일은 우리 마커가 아니므로 손대지 않는다.
+        if not is_recovery_marker(self.recovery_file):
             return False
         restored = reload_saved_system_cursors()
         if restored:
-            self.recovery_file.unlink(missing_ok=True)
+            self._remove_recovery_marker()
         return restored
 
     def _configured_path(self, name: str) -> str:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, CURSOR_KEY) as key:
-            try:
-                value, _ = winreg.QueryValueEx(key, name)
-            except FileNotFoundError:
-                return ""
-        return os.path.expandvars(str(value))
+        """HKCU 커서 경로를 검증 후 반환. 부적합하면 빈 문자열(시스템 기본으로 폴백).
+
+        HKCU는 사용자 쓰기 가능하므로 값을 그대로 LoadCursorFromFileW에 넘기면
+        조작된 .ani 파일로 파서를 공격할 수 있다(CVE-2007-0038 계열).
+        값 타입/확장자/실존 여부를 확인해 표면을 좁힌다.
+        """
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, CURSOR_KEY) as key:
+                value, value_type = winreg.QueryValueEx(key, name)
+        except OSError:
+            return ""
+        if value_type not in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):
+            return ""
+        expanded = os.path.expandvars(str(value)).strip().strip('"')
+        if not expanded:
+            return ""
+        try:
+            resolved = Path(expanded).resolve(strict=True)
+        except OSError:
+            return ""
+        if resolved.suffix.lower() not in ALLOWED_CURSOR_SUFFIXES:
+            return ""
+        if not resolved.is_file():
+            return ""
+        return str(resolved)
 
     def _load_source(self, name: str, resource_id: int) -> tuple[int, bool]:
         path = self._configured_path(name)
@@ -183,22 +231,39 @@ class CursorManager:
         return int(handle), False
 
     def _write_recovery_marker(self, level: int, pixels: int) -> None:
+        """복구 마커를 원자적으로 기록한다.
+
+        이 마커는 시스템이 갑자기 죽은 뒤 커서를 되돌리기 위한 것이므로,
+        fsync 없이 쓰면 정작 필요한 상황에서 디스크에 없을 수 있다.
+        고정 임시 파일명 대신 mkstemp를 써서 경합도 피한다.
+        """
         self.recovery_file.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.recovery_file.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(
-                {
-                    "restore_with": "SPI_SETCURSORS",
-                    "level": level,
-                    "pixels": pixels,
-                    "created_at": time.time(),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        payload = json.dumps(
+            {
+                "restore_with": "SPI_SETCURSORS",
+                "level": level,
+                "pixels": pixels,
+                "created_at": time.time(),
+                "pid": os.getpid(),
+            },
+            ensure_ascii=False,
+            indent=2,
         )
-        os.replace(temporary, self.recovery_file)
+        fd, temporary_name = tempfile.mkstemp(
+            prefix="recovery-", suffix=".tmp", dir=self.recovery_file.parent
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_name, self.recovery_file)
+        except Exception:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+            raise
 
     def apply(self, level: int) -> int:
         pixels = pointer_level_to_pixels(level)
@@ -222,7 +287,7 @@ class CursorManager:
                 installed += 1
         except Exception:
             reload_saved_system_cursors()
-            self.recovery_file.unlink(missing_ok=True)
+            self._remove_recovery_marker()
             raise
 
         self.applied = True
@@ -231,11 +296,11 @@ class CursorManager:
         return installed
 
     def restore(self) -> bool:
-        if not self.applied and not self.recovery_file.exists():
+        if not self.applied and not is_recovery_marker(self.recovery_file):
             return True
         restored = reload_saved_system_cursors()
         if restored:
-            self.recovery_file.unlink(missing_ok=True)
+            self._remove_recovery_marker()
             self.applied = False
             self.applied_level = None
             self.applied_count = 0

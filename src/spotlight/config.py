@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import configparser
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,13 @@ color=#34C759
 duration_ms=250
 line_width=4
 """
+
+
+# int(value, 16) 기반 검증은 Python 정수 리터럴 문법을 그대로 허용해
+# "#12_345"(언더스코어 구분자), "#+12345", "#0x1234", "#  1234"가 모두 통과한다.
+# settings.ini는 사용자 쓰기 가능 경로이므로 여기가 검증 경계다.
+# \A/\Z 앵커를 쓴다(^/$는 개행이 포함된 입력에서 우회된다).
+COLOR_PATTERN = re.compile(r"\A#[0-9A-F]{6}\Z")
 
 
 @dataclass(frozen=True)
@@ -147,13 +155,7 @@ def _color(
         value = parser.get(section, option).strip().upper()
     except configparser.Error:
         return default
-    if len(value) == 7 and value.startswith("#"):
-        try:
-            int(value[1:], 16)
-            return value
-        except ValueError:
-            pass
-    return default
+    return value if COLOR_PATTERN.match(value) else default
 
 
 def load_settings(path: Path | None = None) -> Settings:

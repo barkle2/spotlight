@@ -1,3 +1,15 @@
+"""[LEGACY] pynput 프로토타입 시절 검증 스크립트.
+
+v0.2.0에서 제품 코드는 pynput을 완전히 제거하고 Windows Raw Input API로
+전환했다. 이 스크립트는 pynput 리스너/컨트롤러 동작을 검증하던 것으로
+현재 제품 구조와 맞지 않는다.
+
+Raw Input 전환 이후의 검증은 validation/RAW_INPUT_MANUAL_CHECKLIST.md 를
+사용한다. 이 파일은 이력 보존 목적으로만 남겨 둔다.
+
+실행하려면 pynput을 별도로 설치해야 한다(제품 의존성이 아니다).
+"""
+
 from __future__ import annotations
 
 import json
@@ -12,7 +24,14 @@ sys.path.insert(0, str(ROOT / "src"))
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QMouseEvent, QWheelEvent
 from PySide6.QtWidgets import QApplication, QWidget
-from pynput import mouse
+try:
+    from pynput import mouse
+except ImportError as exc:  # pragma: no cover - legacy tool
+    raise SystemExit(
+        "[LEGACY] 이 스크립트는 pynput이 필요합니다. "
+        "제품에서는 v0.2.0부터 pynput을 제거했으므로 기본 설치되지 않습니다.\n"
+        "Raw Input 전환 이후 검증은 validation/RAW_INPUT_MANUAL_CHECKLIST.md 를 사용하십시오."
+    ) from exc
 
 from spotlight.app import SpotlightApplication
 
