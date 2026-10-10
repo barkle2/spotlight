@@ -1,0 +1,10 @@
+{
+  "archive": "mesa-11.2.2.tar.xz",
+  "bytes": 7860932,
+  "sha256": "40e148812388ec7c6d7b6657d5a16e2e8dabba8b97ddfceea5197947647bdfb4",
+  "archive_read": "passed",
+  "notice_files": [
+    "docs\\licenses\\mesa-notices\\mesa-11.2.2\\docs\\COPYING",
+    "docs\\licenses\\mesa-notices\\mesa-11.2.2\\docs\\license.html"
+  ]
+}

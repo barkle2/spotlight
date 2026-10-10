@@ -1,352 +1,504 @@
-from __future__ import annotations
+"""강조원·클릭·휠·포인터 설정 화면을 제공합니다.
 
-import hashlib
-import sys
-from pathlib import Path
+입력값을 공통 설정 모델로 검증하고, 프리뷰와 적용을 앱에 요청합니다.
+설정 파일 저장과 실제 효과·시스템 커서 변경은 앱의 콜백이 담당합니다.
+취소하면 창을 열었을 때 또는 마지막 적용 시점의 설정으로 복구합니다.
+"""
 
+from .cursor import cursor_size_from_level
+from collections.abc import Callable
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QApplication,
     QCheckBox,
-    QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
-    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
+    QSpinBox,
+    QVBoxLayout,
+    QTabWidget,
+    QWidget,
+    QColorDialog,
+    QHBoxLayout,
     QPushButton,
     QSlider,
-    QSpinBox,
-    QTabWidget,
-    QVBoxLayout,
-    QWidget,
 )
 
-from . import (
-    __company__,
-    __copyright__,
-    __description__,
-    __original_filename__,
-    __product__,
-    __version__,
-)
 from .config import (
-    COLOR_PATTERN,
-    ClickSettings,
-    PointerSettings,
-    Settings,
-    SpotlightSettings,
-    WheelSettings,
+    HighlightSettings,
+    MAX_DIAMETER,
+    MAX_LINE_WIDTH,
+    MIN_DIAMETER,
+    MIN_LINE_WIDTH,
+    MAX_CLICK_DURATION_MS,
+    MIN_CLICK_DURATION_MS,
+    MIN_WHEEL_DURATION_MS,
+    MAX_WHEEL_DURATION_MS,
+    MIN_CURSOR_LEVEL,
+    MAX_CURSOR_LEVEL,
+    normalize_color,    
 )
-
-
-HASH_CHUNK_BYTES = 1024 * 1024
-
-
-def executable_path() -> Path | None:
-    """배포된 실행 파일 경로. 소스에서 실행 중이면 None."""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable)
-    return None
-
-
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(HASH_CHUNK_BYTES), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-class ColorEditor(QWidget):
-    def __init__(self, color: str) -> None:
-        super().__init__()
-        self.edit = QLineEdit(color)
-        self.edit.setMaxLength(7)
-        self.button = QPushButton("색상 선택")
-        self.button.clicked.connect(self.choose_color)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.edit)
-        layout.addWidget(self.button)
-        self._update_button()
-        self.edit.textChanged.connect(self._update_button)
-
-    def choose_color(self) -> None:
-        initial = QColor(self.value())
-        selected = QColorDialog.getColor(initial, self, "색상 선택")
-        if selected.isValid():
-            self.edit.setText(selected.name().upper())
-
-    def _update_button(self) -> None:
-        color = QColor(self.edit.text())
-        if color.isValid():
-            self.button.setStyleSheet(
-                f"background-color: {color.name()}; color: "
-                f"{'black' if color.lightness() > 130 else 'white'};"
-            )
-        else:
-            self.button.setStyleSheet("")
-
-    def value(self) -> str:
-        value = self.edit.text().strip().upper()
-        if not COLOR_PATTERN.match(value):
-            raise ValueError("색상은 #RRGGBB 형식이어야 합니다.")
-        return value
-
-
-def spin(value: int, minimum: int, maximum: int, suffix: str = "") -> QSpinBox:
-    widget = QSpinBox()
-    widget.setRange(minimum, maximum)
-    widget.setValue(value)
-    if suffix:
-        widget.setSuffix(suffix)
-    return widget
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, settings: Settings, on_apply, on_pointer_preview, parent=None) -> None:
-        super().__init__(parent)
-        self.on_apply = on_apply
-        self.on_pointer_preview = on_pointer_preview
-        self.applied_settings = settings
-        self.about_tab_index = -1
-        self.hash_computed = False
+    """편집 중인 입력값과 마지막 적용값을 구분하여 관리합니다.
+
+    프리뷰는 저장 없이 실행 화면에 반영합니다.
+    적용 콜백이 성공한 경우에만 applied_settings를 갱신하여
+    이후 취소·X·Esc의 복구 기준으로 사용합니다.
+    """
+
+    def __init__(
+        self,
+        settings: HighlightSettings,
+        preview_callback: Callable[[HighlightSettings], None],
+        apply_callback: Callable[[HighlightSettings], bool],
+    ) -> None:
+        super().__init__()
+
         self.setWindowTitle("Spotlight 설정")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(480)
+
+        # 취소하면 창을 열었을 때 또는 마지막 적용 시점의 값으로 복구합니다.
+        self.applied_settings = settings
+        self.preview_callback = preview_callback
+        self.apply_callback = apply_callback
+
+        # 입력 필드 초기화 중에는 중간 값으로 프리뷰하지 않습니다.
+        self.loading = False
+
+        self.enabled_checkbox = QCheckBox("강조 원 표시")
+
+        self.diameter_spinbox = QSpinBox()
+        self.diameter_spinbox.setRange(MIN_DIAMETER, MAX_DIAMETER)
+
+        self.color_edit = QLineEdit()
+        self.color_edit.setPlaceholderText("#RRGGBB")
+
+        self.opacity_spinbox = QSpinBox()
+        self.opacity_spinbox.setRange(0, 100)
+        self.opacity_spinbox.setSuffix(" %")
+
+        self.style_combobox = QComboBox()
+        self.style_combobox.addItem("채움", "fill")
+        self.style_combobox.addItem("테두리", "outline")
+
+        self.line_width_spinbox = QSpinBox()
+        self.line_width_spinbox.setRange(MIN_LINE_WIDTH, MAX_LINE_WIDTH)
+
+        self.click_enabled_checkbox = QCheckBox("클릭 효과 표시")
+        self.left_click_color_edit = QLineEdit()
+        self.right_click_color_edit = QLineEdit()
+
+        self.click_duration_spinbox = QSpinBox()
+        self.click_duration_spinbox.setRange(
+            MIN_CLICK_DURATION_MS, MAX_CLICK_DURATION_MS
+        )
+        self.click_duration_spinbox.setSuffix(" ms")
+        self.click_style_combobox = QComboBox()
+        self.click_style_combobox.addItem("채움", "fill")
+        self.click_style_combobox.addItem("테두리", "outline")
+
+        self.click_line_width_spinbox = QSpinBox()
+        self.click_line_width_spinbox.setRange(
+            MIN_LINE_WIDTH, MAX_LINE_WIDTH
+        )
+
+        self.wheel_enabled_checkbox = QCheckBox("휠 효과 표시")
+        self.wheel_color_edit = QLineEdit()
+        self.wheel_duration_spinbox = QSpinBox()
+        self.wheel_duration_spinbox.setRange(
+            MIN_WHEEL_DURATION_MS, MAX_WHEEL_DURATION_MS
+        )
+        self.wheel_duration_spinbox.setSuffix(" ms")
+
+        self.wheel_line_width_spinbox = QSpinBox()
+        self.wheel_line_width_spinbox.setRange(
+            MIN_LINE_WIDTH, MAX_LINE_WIDTH
+        )
+
+        self.cursor_enabled_checkbox = QCheckBox("포인터 확대 사용")
+
+        self.cursor_level_slider = QSlider(Qt.Orientation.Horizontal)
+        self.cursor_level_slider.setRange(
+            MIN_CURSOR_LEVEL, MAX_CURSOR_LEVEL
+        )
+        self.cursor_level_slider.setSingleStep(1)
+        self.cursor_level_slider.setPageStep(1)
+        self.cursor_level_slider.setTickInterval(1)
+        self.cursor_level_slider.setTickPosition(
+            QSlider.TickPosition.TicksBelow
+        )
+
+        # 드래그 중 시스템 커서 14종을 계속 교체하지 않도록
+        # 실제 값 변경은 슬라이더를 놓았을 때 반영합니다.
+        self.cursor_level_slider.setTracking(False)
+        self.cursor_level_slider.setToolTip(
+            "1~15단계. 슬라이더를 놓으면 포인터 크기가 반영됩니다."
+        )
+
+        self.cursor_level_label = QLabel()
+
+        self.cursor_size_widget = QWidget()
+        cursor_size_layout = QVBoxLayout(self.cursor_size_widget)
+        cursor_size_layout.setContentsMargins(0, 0, 0, 0)
+        cursor_size_layout.addWidget(self.cursor_level_slider)
+        cursor_size_layout.addWidget(self.cursor_level_label)
+
+        # 움직이는 동안에는 표시 문구만 갱신합니다.
+        self.cursor_level_slider.sliderMoved.connect(
+            self.update_cursor_level_label
+        )
+
+        # 기능별 입력 필드를 나누되 설정 모델과 저장 흐름은 공유합니다.
         self.tabs = QTabWidget()
-        self._build_pointer_tab(settings)
-        self._build_spotlight_tab(settings)
-        self._build_click_tab(settings)
-        self._build_wheel_tab(settings)
-        self._build_about_tab()
+
+        highlight_page = QWidget()
+        highlight_form = QFormLayout(highlight_page)
+        highlight_form.addRow("활성화", self.enabled_checkbox)
+        highlight_form.addRow("지름", self.diameter_spinbox)
+        highlight_form.addRow(
+            "색상", self.create_color_selector(self.color_edit)
+        )
+        highlight_form.addRow("불투명도", self.opacity_spinbox)
+        highlight_form.addRow("표시 방식", self.style_combobox)
+        highlight_form.addRow("선 두께", self.line_width_spinbox)
+        self.tabs.addTab(highlight_page, "강조원")
+
+        click_page = QWidget()
+        click_form = QFormLayout(click_page)
+        click_form.addRow("활성화", self.click_enabled_checkbox)
+        click_form.addRow(
+            "왼쪽 색상", self.create_color_selector(self.left_click_color_edit)
+        )
+        click_form.addRow(
+            "오른쪽 색상", self.create_color_selector(self.right_click_color_edit)
+        )
+        click_form.addRow("지속 시간", self.click_duration_spinbox)
+        click_form.addRow("표시 방식", self.click_style_combobox)
+        click_form.addRow("선 두께", self.click_line_width_spinbox)
+        self.tabs.addTab(click_page, "클릭")
+
+        wheel_page = QWidget()
+        wheel_form = QFormLayout(wheel_page)
+        wheel_form.addRow("활성화", self.wheel_enabled_checkbox)        
+        wheel_form.addRow(
+            "색상", self.create_color_selector(self.wheel_color_edit)
+        )
+        wheel_form.addRow("지속 시간", self.wheel_duration_spinbox)
+        wheel_form.addRow("선 두께", self.wheel_line_width_spinbox)
+        self.tabs.addTab(wheel_page, "휠")
+
+        pointer_page = QWidget()
+        pointer_form = QFormLayout(pointer_page)
+        pointer_form.addRow("활성화", self.cursor_enabled_checkbox)
+        pointer_form.addRow("크기", self.cursor_size_widget)        
+        self.tabs.addTab(pointer_page, "포인터")
+
+        self.validation_label = QLabel()
+        self.validation_label.setWordWrap(True)
 
         self.buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.Apply
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Apply
+            | QDialogButtonBox.StandardButton.Cancel
         )
-        self.buttons.accepted.connect(self._accept)
-        self.buttons.rejected.connect(self.reject)
-        apply_button = self.buttons.button(QDialogButtonBox.Apply)
-        apply_button.setEnabled(True)
-        apply_button.clicked.connect(self._apply)
+        self.buttons.button(
+            QDialogButtonBox.StandardButton.Ok
+        ).setText("확인")
+        self.buttons.button(
+            QDialogButtonBox.StandardButton.Apply
+        ).setText("적용")
+        self.buttons.button(
+            QDialogButtonBox.StandardButton.Cancel
+        ).setText("취소")
+
+        self.reset_button = QPushButton("전체 초기화")
+        self.reset_button.setAutoDefault(False)
+        self.reset_button.setToolTip(
+            "모든 설정을 기본값으로 미리 표시합니다. "
+            "적용 또는 확인을 눌러야 저장됩니다."
+        )
+        self.reset_button.clicked.connect(self.reset_to_defaults)
+
+        # 초기화는 왼쪽, 확인·적용·취소는 오른쪽에 배치합니다.
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.reset_button)
+        button_row.addStretch()
+        button_row.addWidget(self.buttons)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.tabs)
-        layout.addWidget(self.buttons)
+        layout.addWidget(self.validation_label)
+        layout.addLayout(button_row)
 
-    def _build_pointer_tab(self, settings: Settings) -> None:
-        page = QWidget()
-        form = QFormLayout(page)
-        self.pointer_size = QSlider(Qt.Horizontal)
-        self.pointer_size.setRange(1, 15)
-        self.pointer_size.setSingleStep(1)
-        self.pointer_size.setPageStep(1)
-        self.pointer_size.setTickInterval(1)
-        self.pointer_size.setTickPosition(QSlider.TicksBelow)
-        self.pointer_size.setValue(settings.pointer.size)
-        self.pointer_size_value = QLabel(str(settings.pointer.size))
-        slider_row = QHBoxLayout()
-        slider_row.addWidget(self.pointer_size, 1)
-        slider_row.addWidget(self.pointer_size_value)
-        form.addRow("포인터 크기", slider_row)
-        form.addRow(QLabel("1은 32px이며 단계마다 16px씩 증가합니다."))
-        self.pointer_size.valueChanged.connect(self._apply_pointer_size)
-        self.tabs.addTab(page, "포인터")
+        # 유효한 입력값만 실제 강조 원에 프리뷰합니다.
+        self.enabled_checkbox.toggled.connect(self.preview)
+        self.diameter_spinbox.valueChanged.connect(self.preview)
+        self.color_edit.textChanged.connect(self.preview)
+        self.opacity_spinbox.valueChanged.connect(self.preview)
+        self.style_combobox.currentIndexChanged.connect(self.preview)
+        self.line_width_spinbox.valueChanged.connect(self.preview)
+        self.click_enabled_checkbox.toggled.connect(self.preview)
+        self.left_click_color_edit.textChanged.connect(self.preview)
+        self.right_click_color_edit.textChanged.connect(self.preview)
+        self.click_duration_spinbox.valueChanged.connect(self.preview)
+        self.click_style_combobox.currentIndexChanged.connect(self.preview)
+        self.click_line_width_spinbox.valueChanged.connect(self.preview)
+        self.wheel_enabled_checkbox.toggled.connect(self.preview)        
+        self.wheel_color_edit.textChanged.connect(self.preview)
+        self.wheel_duration_spinbox.valueChanged.connect(self.preview)
+        self.wheel_line_width_spinbox.valueChanged.connect(self.preview)
+        self.cursor_enabled_checkbox.toggled.connect(self.preview)
+        self.cursor_level_slider.valueChanged.connect(self.preview)        
 
-    def _apply_pointer_size(self, size: int) -> None:
-        self.pointer_size_value.setText(str(size))
-        try:
-            self.on_pointer_preview(size)
-        except Exception as exc:
-            self.notify_preview_error(str(exc), self.applied_settings.pointer.size)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        self.buttons.button(
+            QDialogButtonBox.StandardButton.Apply
+        ).clicked.connect(self.apply_changes)
 
-    def notify_preview_error(self, message: str, fallback_size: int) -> None:
-        """프리뷰 적용 실패 통지.
+        self.load_fields(settings)
 
-        포인터 프리뷰는 디바운스되어 슬라이더 콜백보다 늦게 실행되므로,
-        실패는 이 메서드를 통해 뒤늦게 전달된다. 슬라이더를 되돌린 뒤 알린다.
+    def create_color_selector(self, color_edit: QLineEdit) -> QWidget:
+        """색상 견본·색상 코드 입력·팔레트를 하나로 구성합니다.
+
+        팔레트에서 선택한 색상을 기존 입력 필드에 기록하여
+        공통 색상 검증과 프리뷰·적용·취소 흐름을 사용합니다.
+        팔레트를 취소하면 입력값을 변경하지 않습니다.
         """
-        self.pointer_size.blockSignals(True)
-        self.pointer_size.setValue(fallback_size)
-        self.pointer_size.blockSignals(False)
-        self.pointer_size_value.setText(str(fallback_size))
-        QMessageBox.warning(self, "설정 오류", message)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-    def _build_spotlight_tab(self, settings: Settings) -> None:
-        page = QWidget()
-        form = QFormLayout(page)
-        current = settings.spotlight
-        self.spotlight_enabled = QCheckBox("강조 원 표시")
-        self.spotlight_enabled.setChecked(current.enabled)
-        self.spotlight_diameter = spin(current.diameter, 20, 1000, " px")
-        self.spotlight_color = ColorEditor(current.color)
-        self.spotlight_opacity = spin(current.opacity, 0, 100, " %")
-        self.spotlight_style = QComboBox()
-        self.spotlight_style.addItem("채움", "fill")
-        self.spotlight_style.addItem("테두리", "outline")
-        self.spotlight_style.setCurrentIndex(
-            max(0, self.spotlight_style.findData(current.style))
+        top_row = QHBoxLayout()
+
+        swatch = QLabel()
+        swatch.setFixedSize(28, 28)
+        swatch.setToolTip("현재 선택한 색상")
+
+        color_edit.setPlaceholderText("#RRGGBB")
+        color_edit.setMaximumWidth(110)
+
+        palette_button = QPushButton("색상 선택")
+        palette_button.setAutoDefault(False)
+
+        top_row.addWidget(swatch)
+        top_row.addWidget(color_edit)
+        top_row.addWidget(palette_button)
+        top_row.addStretch()
+        layout.addLayout(top_row)
+
+        def update_swatch(text: str) -> None:
+            """검증된 색상만 견본에 표시하여 잘못된 입력을 구분합니다."""
+            try:
+                color = normalize_color(text)
+            except ValueError:
+                swatch.setText("?")
+                swatch.setStyleSheet(
+                    "background-color: #EEEEEE;"
+                    "color: #333333;"
+                    "border: 1px solid #888888;"
+                )
+                return
+
+            swatch.clear()
+            swatch.setStyleSheet(
+                f"background-color: {color};"
+                "border: 1px solid #888888;"
+            )
+
+        def choose_palette_color() -> None:
+            """팔레트에서 확인한 색상만 반영하고 취소하면 유지합니다."""
+            try:
+                initial_color = normalize_color(color_edit.text())
+            except ValueError:
+                initial_color = "#FFFF00"
+
+            selected = QColorDialog.getColor(
+                QColor(initial_color),
+                self,
+                "색상 선택",
+            )
+
+            # 팔레트 취소는 잘못된 QColor를 반환하므로 값을 바꾸지 않습니다.
+            if selected.isValid():
+                color_edit.setText(selected.name().upper())
+
+        palette_button.clicked.connect(choose_palette_color)
+        color_edit.textChanged.connect(update_swatch)
+
+        update_swatch(color_edit.text())
+
+        return container
+
+    def update_cursor_level_label(self, level: int | None = None) -> None:
+        """선택 중인 단계와 실제 커서 이미지 크기를 표시합니다."""
+        if level is None:
+            level = self.cursor_level_slider.value()
+
+        size = cursor_size_from_level(level)
+        self.cursor_level_label.setText(
+            f"{level}단계 · {size} × {size}px"
         )
-        self.spotlight_border = spin(current.border_width, 1, 50, " px")
-        form.addRow(self.spotlight_enabled)
-        form.addRow("원 크기", self.spotlight_diameter)
-        form.addRow("색상", self.spotlight_color)
-        form.addRow("불투명도", self.spotlight_opacity)
-        form.addRow("표시 방식", self.spotlight_style)
-        form.addRow("테두리 두께", self.spotlight_border)
-        self.spotlight_border_label = form.labelForField(self.spotlight_border)
-        self.spotlight_style.currentIndexChanged.connect(
-            self._update_spotlight_border_enabled
-        )
-        self._update_spotlight_border_enabled()
-        self.tabs.addTab(page, "강조 원")
 
-    def _update_spotlight_border_enabled(self) -> None:
-        enabled = self.spotlight_style.currentData() == "outline"
-        self.spotlight_border.setEnabled(enabled)
-        self.spotlight_border_label.setEnabled(enabled)
+    def load_fields(self, settings: HighlightSettings) -> None:
+        """설정을 입력 필드에 표시하고 초기화 중 프리뷰를 막습니다."""
+        self.loading = True
 
-    def _build_click_tab(self, settings: Settings) -> None:
-        page = QWidget()
-        form = QFormLayout(page)
-        current = settings.click
-        self.click_enabled = QCheckBox("클릭 효과 사용")
-        self.click_enabled.setChecked(current.enabled)
-        self.left_color = ColorEditor(current.left_color)
-        self.right_color = ColorEditor(current.right_color)
-        self.click_duration = spin(current.duration_ms, 50, 2000, " ms")
-        form.addRow(self.click_enabled)
-        form.addRow("왼쪽 클릭 색상", self.left_color)
-        form.addRow("오른쪽 클릭 색상", self.right_color)
-        form.addRow("지속 시간", self.click_duration)
-        self.tabs.addTab(page, "클릭")
-
-    def _build_wheel_tab(self, settings: Settings) -> None:
-        page = QWidget()
-        form = QFormLayout(page)
-        current = settings.wheel
-        self.wheel_enabled = QCheckBox("휠 효과 사용")
-        self.wheel_enabled.setChecked(current.enabled)
-        self.wheel_color = ColorEditor(current.color)
-        self.wheel_duration = spin(current.duration_ms, 50, 2000, " ms")
-        self.wheel_line_width = spin(current.line_width, 1, 50, " px")
-        form.addRow(self.wheel_enabled)
-        form.addRow("색상", self.wheel_color)
-        form.addRow("지속 시간", self.wheel_duration)
-        form.addRow("선 두께", self.wheel_line_width)
-        self.tabs.addTab(page, "휠")
-
-    def _build_about_tab(self) -> None:
-        """제품 정보 표시 전용 탭.
-
-        표시 항목은 packaging/version_info.py 의 VERSIONINFO 리소스와
-        동일한 값이며, src/spotlight/__init__.py 를 단일 출처로 사용한다.
-        """
-        page = QWidget()
-        form = QFormLayout(page)
-
-        title = QLabel(f"<b>{__product__}</b>")
-        form.addRow(title)
-
-        form.addRow("설명", QLabel(__description__))
-        form.addRow("버전", QLabel(__version__))
-        form.addRow("배포", QLabel(__company__))
-        form.addRow("파일명", QLabel(__original_filename__))
-
-        copyright_label = QLabel(__copyright__)
-        copyright_label.setWordWrap(True)
-        form.addRow("저작권", copyright_label)
-
-        # 해시는 64자 16진수이므로 등폭 글꼴로 줄바꿈해 표시한다.
-        # 클립보드 API를 사용하지 않고 텍스트 선택만 허용한다. 사용자는
-        # 선택 후 Ctrl+C 로 복사할 수 있고, 앱은 클립보드 권한을 갖지 않는다.
-        self.about_hash = QLabel(self._initial_hash_text())
-        self.about_hash.setWordWrap(True)
-        self.about_hash.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.about_hash.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
-        form.addRow("SHA-256", self.about_hash)
-
-        hash_note = QLabel("배포 시 공지된 해시와 대조해 파일 변조 여부를 확인할 수 있습니다.")
-        hash_note.setWordWrap(True)
-        form.addRow("", hash_note)
-
-        self.about_tab_index = self.tabs.count()
-        self.tabs.addTab(page, "정보")
-        # 다이얼로그 열기가 느려지지 않도록 정보 탭을 처음 열 때 계산한다.
-        self.tabs.currentChanged.connect(self._on_tab_changed)
-
-    def _initial_hash_text(self) -> str:
-        return "정보 탭을 열면 계산합니다." if executable_path() else "실행 파일에서만 표시됩니다."
-
-    def _on_tab_changed(self, index: int) -> None:
-        if index == self.about_tab_index:
-            self.ensure_executable_hash()
-
-    def ensure_executable_hash(self) -> None:
-        """실행 파일 해시를 한 번만 계산해 표시한다."""
-        if self.hash_computed:
-            return
-        executable = executable_path()
-        if executable is None:
-            self.hash_computed = True
-            return
-        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            self.about_hash.setText(file_sha256(executable))
-        except OSError as exc:
-            self.about_hash.setText(f"계산할 수 없습니다: {exc.strerror or exc}")
+            self.enabled_checkbox.setChecked(settings.enabled)
+            self.diameter_spinbox.setValue(settings.diameter)
+            self.color_edit.setText(settings.color)
+            self.opacity_spinbox.setValue(settings.opacity)
+            self.style_combobox.setCurrentIndex(
+                self.style_combobox.findData(settings.style)
+            )
+            self.line_width_spinbox.setValue(settings.line_width)
+            self.line_width_spinbox.setEnabled(settings.style == "outline")
+            self.click_enabled_checkbox.setChecked(settings.click_enabled)
+            self.left_click_color_edit.setText(settings.left_click_color)
+            self.right_click_color_edit.setText(settings.right_click_color)
+            self.click_duration_spinbox.setValue(settings.click_duration_ms)
+            self.click_style_combobox.setCurrentIndex(
+                self.click_style_combobox.findData(settings.click_style)
+            )
+            self.click_line_width_spinbox.setValue(settings.click_line_width)
+            self.click_line_width_spinbox.setEnabled(
+                settings.click_style == "outline"
+            )
+            self.wheel_enabled_checkbox.setChecked(settings.wheel_enabled)            
+            self.wheel_color_edit.setText(settings.wheel_color)
+            self.wheel_duration_spinbox.setValue(settings.wheel_duration_ms)
+            self.wheel_line_width_spinbox.setValue(settings.wheel_line_width)
+            self.cursor_enabled_checkbox.setChecked(settings.cursor_enabled)
+            self.cursor_level_slider.setValue(settings.cursor_level)
+            self.cursor_level_slider.setEnabled(settings.cursor_enabled)
+            self.update_cursor_level_label()            
+
+            self.validation_label.clear()
         finally:
-            QApplication.restoreOverrideCursor()
-            self.hash_computed = True
+            self.loading = False
 
-    def current_settings(self) -> Settings:
-        return Settings(
-            pointer=PointerSettings(size=self.pointer_size.value()),
-            spotlight=SpotlightSettings(
-                enabled=self.spotlight_enabled.isChecked(),
-                diameter=self.spotlight_diameter.value(),
-                color=self.spotlight_color.value(),
-                opacity=self.spotlight_opacity.value(),
-                style=str(self.spotlight_style.currentData()),
-                border_width=self.spotlight_border.value(),
-            ),
-            click=ClickSettings(
-                enabled=self.click_enabled.isChecked(),
-                left_color=self.left_color.value(),
-                right_color=self.right_color.value(),
-                duration_ms=self.click_duration.value(),
-            ),
-            wheel=WheelSettings(
-                enabled=self.wheel_enabled.isChecked(),
-                color=self.wheel_color.value(),
-                duration_ms=self.wheel_duration.value(),
-                line_width=self.wheel_line_width.value(),
-            ),
+    def read_fields(self) -> HighlightSettings:
+        """네 기능 탭의 입력값을 검증된 설정 객체로 반환합니다.
+
+        HighlightSettings 생성 과정에서 타입·범위·색상을 검증합니다.
+        유효하지 않은 입력은 ValueError로 호출부에 전달합니다.
+        이 메서드는 실행 상태를 바꾸거나 설정 파일을 저장하지 않습니다.
+        """
+        return HighlightSettings(
+            enabled=self.enabled_checkbox.isChecked(),
+            diameter=self.diameter_spinbox.value(),
+            color=self.color_edit.text(),
+            opacity=self.opacity_spinbox.value(),
+            style=self.style_combobox.currentData(),
+            line_width=self.line_width_spinbox.value(),
+            click_enabled=self.click_enabled_checkbox.isChecked(),
+            left_click_color=self.left_click_color_edit.text(),
+            right_click_color=self.right_click_color_edit.text(),
+            click_duration_ms=self.click_duration_spinbox.value(),
+            click_style=self.click_style_combobox.currentData(),
+            click_line_width=self.click_line_width_spinbox.value(),
+            wheel_enabled=self.wheel_enabled_checkbox.isChecked(),            
+            wheel_color=self.wheel_color_edit.text(),
+            wheel_duration_ms=self.wheel_duration_spinbox.value(),
+            wheel_line_width=self.wheel_line_width_spinbox.value(),
+            cursor_enabled=self.cursor_enabled_checkbox.isChecked(),
+            cursor_level=self.cursor_level_slider.value(),            
         )
 
-    def _apply(self) -> bool:
+    def preview(self) -> None:
+        """유효한 값은 프리뷰하고 잘못된 값은 화면에 안내합니다."""
+        if self.loading:
+            return
+
+        self.update_cursor_level_label()
+
+        self.line_width_spinbox.setEnabled(
+            self.style_combobox.currentData() == "outline"
+        )
+
+        self.click_line_width_spinbox.setEnabled(
+            self.click_style_combobox.currentData() == "outline"
+        )        
+
+        self.cursor_level_slider.setEnabled(
+            self.cursor_enabled_checkbox.isChecked()
+        )
+
         try:
-            settings = self.current_settings()
-            self.on_apply(settings)
-            self.applied_settings = settings
-            return True
-        except Exception as exc:
-            QMessageBox.warning(self, "설정 오류", str(exc))
+            settings = self.read_fields()
+        except ValueError as error:
+            # 색상 입력 도중 매번 팝업을 띄우지 않습니다.
+            # 마지막으로 유효했던 프리뷰 화면은 그대로 유지합니다.
+            self.validation_label.setText(str(error))
+            return
+
+        self.validation_label.clear()
+        self.preview_callback(settings)
+
+    def reset_to_defaults(self) -> None:
+        """모든 설정을 기본값으로 표시하고 저장 없이 프리뷰합니다.
+
+        필드 변경 중에는 load_fields가 중간 프리뷰를 막습니다.
+        전체 필드를 채운 뒤 한 번만 프리뷰하여 포인터 변경을 줄입니다.
+        마지막 적용값은 유지하므로 취소·X·Esc로 복구할 수 있습니다.
+        """
+        defaults = HighlightSettings()
+        self.load_fields(defaults)
+        self.preview()        
+
+    def apply_changes(self) -> bool:
+        """입력 검증과 적용이 성공하면 취소 기준값을 갱신합니다.
+
+        앱의 적용 콜백이 실행 상태 반영과 설정 파일 저장을 담당합니다.
+        입력 검증 또는 적용이 실패하면 False를 반환하고,
+        성공하면 마지막 적용값을 갱신한 뒤 True를 반환합니다.
+        """
+        try:
+            settings = self.read_fields()
+        except ValueError as error:
+            QMessageBox.warning(self, "설정값 확인", str(error))
             return False
 
-    def _accept(self) -> None:
-        if self._apply():
-            self.accept()
+        # 적용 콜백이 실패하면 마지막 적용값을 유지합니다.
+        # 실행 상태 반영과 저장이 성공한 뒤에만 취소 기준을 갱신합니다.
+        if not self.apply_callback(settings):
+            return False
+
+        self.applied_settings = settings
+        self.validation_label.clear()
+        return True
+
+    def accept(self) -> None:
+        """확인 버튼은 적용 성공 시에만 창을 닫습니다."""
+        if self.apply_changes():
+            super().accept()
 
     def reject(self) -> None:
-        try:
-            # 취소는 즉시 되돌려야 하므로 디바운스를 우회한다.
-            self.on_pointer_preview(self.applied_settings.pointer.size, immediate=True)
-        except Exception as exc:
-            QMessageBox.warning(self, "설정 오류", str(exc))
-            return
+        """취소·Esc·창 닫기 시 마지막 적용값으로 복구합니다."""
+        self.preview_callback(self.applied_settings)
         super().reject()
+
+    def open_settings(self) -> None:
+        """이미 열려 있으면 활성화하고, 새로 열 때 적용값을 표시합니다."""
+        if not self.isVisible():
+            self.load_fields(self.applied_settings)
+            self.show()
+
+        self.raise_()
+        self.activateWindow()
+
+    def stop(self) -> None:
+        """프로그램 종료 시 reject()를 호출하여 설정 창을 닫습니다.
+
+        reject()는 마지막 적용값으로 프리뷰 복구를 요청합니다.
+        앱 종료 중에는 앱의 종료 플래그가 해당 요청을 차단하며,
+        실제 시스템 커서 복원은 커서 컨트롤러의 종료 처리가 담당합니다.
+        """
+        self.reject()

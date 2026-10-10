@@ -1,53 +1,55 @@
-# Python bytecode and caches
+# Python이 생성하는 캐시와 임시 파일
 __pycache__/
 *.py[cod]
-*$py.class
-
-# Virtual environments
-.venv/
-venv/
-env/
-ENV/
-
-# Test, coverage, and type-checker caches
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 .coverage.*
 htmlcov/
-.mypy_cache/
-.ruff_cache/
-.tox/
-.nox/
 
-# Python packaging and PyInstaller output
-build/
-dist/
+# 가상환경과 설치/패키지 중간 파일
+.venv/
+venv/
+env/
 *.egg-info/
-*.egg
 
-# Generated validation output
-validation/artifacts/
+# 빌드·배포 산출물은 Git 대신 별도 배포 자료로 관리합니다.
+/build/
+/dist/
+/tmp/
+/packaging/version_info.txt
 
-# Local configuration and secrets
-.env
-.env.*
-!.env.example
-*.local
+# 큰 제3자 소스 원본 묶음은 별도로 제공합니다.
+# docs/licenses/의 라이선스 원문과 고지는 저장소에 포함합니다.
+/docs/third-party-sources/
 
-# Editor and IDE settings
-.vscode/
-.idea/
-*.code-workspace
+# 로컬 참고자료와 정리 보관 파일
+/docs/정리보관/
+/docs/메일.pdf
 
-# Operating system files
+
+# 로컬 편집기 설정과 운영체제 임시 파일
+/.vscode/
+/.idea/
 .DS_Store
 Thumbs.db
 Desktop.ini
-
-# Logs and temporary files
 *.log
-*.tmp
-*.temp
-*.bak
-*.swp
-~$*
+
+# 로컬 환경 설정과 인증서·개인키
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+
+# 공개 저장소에 불필요한 내부 검토·작업 문서
+/docs/라이선스_대조결과.md
+/docs/폴더정리_기록.md
+/docs/사용설명서_캡처계획.md
+
+# 개인 PC 경로가 포함된 원본 검증 자료는 로컬에 보관합니다.
+/docs/validation/

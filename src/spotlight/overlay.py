@@ -1,234 +1,120 @@
-from __future__ import annotations
+"""설정값에 따라 마우스 포인터 주변의 강조 원을 표시합니다."""
 
-import time
-from dataclasses import dataclass
+from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtGui import QColor, QCursor, QPainter, QPaintEvent, QPen
+from PySide6.QtWidgets import QWidget
 
-from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QCursor, QPainter, QPen
-from PySide6.QtWidgets import QApplication, QWidget
-
-from .config import ClickSettings, SpotlightSettings, WheelSettings
-
-
-@dataclass
-class Effect:
-    kind: str
-    position: QPointF
-    started_at: float
-    duration_ms: int
-    start_diameter: float
-    end_diameter: float
-    color: QColor
-    line_width: int
-
-    def progress(self, now: float) -> float:
-        return min(1.0, max(0.0, (now - self.started_at) * 1000 / self.duration_ms))
-
-    def diameter(self, now: float) -> float:
-        progress = self.progress(now)
-        return self.start_diameter + (self.end_diameter - self.start_diameter) * progress
-
-    def expired(self, now: float) -> bool:
-        return self.progress(now) >= 1.0
+from .config import HighlightSettings
 
 
 class SpotlightOverlay(QWidget):
-    def __init__(
-        self,
-        spotlight: SpotlightSettings,
-        click: ClickSettings,
-        wheel: WheelSettings,
-    ) -> None:
+    """입력을 방해하지 않는 설정 가능한 강조 창입니다."""
+
+    def __init__(self) -> None:
         super().__init__()
-        self.spotlight = spotlight
-        self.click = click
-        self.wheel = wheel
-        self.pointer = QPoint()
-        self.effects: list[Effect] = []
-        self.total_effects = 0
-        self.max_active_effects = 0
-        self.effect_kind_counts: dict[str, int] = {}
-        self.setWindowTitle("Spotlight Overlay")
+
         self.setWindowFlags(
-            Qt.FramelessWindowHint
-            | Qt.WindowStaysOnTopHint
-            | Qt.Tool
-            | Qt.WindowTransparentForInput
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowTransparentForInput
+            | Qt.WindowType.WindowDoesNotAcceptFocus
         )
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self._set_virtual_geometry()
-        self._connect_screen_signals()
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
-        self.timer = QTimer(self)
-        self.timer.setInterval(16)
-        self.timer.timeout.connect(self._tick)
+        # 실행 여부와 설정의 활성화 여부를 구분합니다.
+        # 설정 변경만으로 종료된 창이 다시 나타나지 않도록 합니다.
+        self.running = False
+        self.padding = 2
 
-    def _connect_screen_signals(self) -> None:
-        """모니터 구성 변경을 구독한다.
+        self.position_timer = QTimer(self)
+        self.position_timer.setInterval(16)
+        self.position_timer.timeout.connect(self.update_position)
 
-        도킹/해제, 해상도 변경, 모니터 추가 시 가상 데스크톱 영역이 바뀌므로
-        생성 시점의 geometry를 그대로 두면 오버레이가 화면을 덮지 못한다.
-        """
-        application = QApplication.instance()
-        if application is not None:
-            application.screenAdded.connect(self._on_screen_added)
-            application.screenRemoved.connect(self._on_screens_changed)
-        for screen in QApplication.screens():
-            self._connect_screen(screen)
+        # 기본 설정으로 초기화하고, 앱에서 읽은 설정은 별도로 반영합니다.
+        self.apply_settings(HighlightSettings())
 
-    def _connect_screen(self, screen) -> None:
-        screen.geometryChanged.connect(self._on_screens_changed)
-        screen.logicalDotsPerInchChanged.connect(self._on_screens_changed)
+    def apply_settings(self, settings: HighlightSettings) -> None:
+        """검증된 설정을 반영하고 실행 중이면 표시 상태를 갱신합니다."""
+        if not isinstance(settings, HighlightSettings):
+            raise TypeError("HighlightSettings 객체가 필요합니다.")
 
-    def _on_screen_added(self, screen) -> None:
-        self._connect_screen(screen)
-        self._on_screens_changed()
+        self.settings = settings
 
-    def _on_screens_changed(self, *_) -> None:
-        self._set_virtual_geometry()
+        window_size = settings.diameter + self.padding * 2
+        self.setFixedSize(window_size, window_size)
+
+        self.highlight_color = QColor(settings.color)
+        self.highlight_color.setAlphaF(settings.opacity / 100.0)
+
+        self.update_position()
         self.update()
 
-    def _set_virtual_geometry(self) -> None:
-        screens = QApplication.screens()
-        if not screens:
-            return
-        virtual = QRect(screens[0].geometry())
-        for screen in screens[1:]:
-            virtual = virtual.united(screen.geometry())
-        self.setGeometry(virtual)
+        if self.running:
+            self.refresh_visibility()
+
+    def refresh_visibility(self) -> None:
+        """실행·활성화 상태에 맞춰 창과 추적 타이머를 조절합니다."""
+        if self.running and self.settings.enabled:
+            self.update_position()
+            self.show()
+            self.position_timer.start()
+        else:
+            # 비활성화 상태에서는 위치 추적도 중지합니다.
+            self.position_timer.stop()
+            self.hide()
 
     def start(self) -> None:
-        self._track_pointer()
-        self.show()
-        self.timer.start()
+        """강조 기능을 시작합니다."""
+        self.running = True
+        self.refresh_visibility()
 
     def stop(self) -> None:
-        self.timer.stop()
-        self.effects.clear()
-        self.hide()
+        """위치 추적을 중지하고 강조 창을 닫습니다."""
+        self.running = False
+        self.position_timer.stop()
+        self.close()
 
-    def apply_settings(
-        self,
-        spotlight: SpotlightSettings,
-        click: ClickSettings,
-        wheel: WheelSettings,
-    ) -> None:
-        self.spotlight = spotlight
-        self.click = click
-        self.wheel = wheel
-        # 정지 상태에서 설정만 바뀐 경우 다시 표시하지 않는다.
-        if self.timer.isActive() or self.isVisible():
-            self.start()
-        self.update()
+    def update_position(self) -> None:
+        """강조 원 중심을 커서의 Qt 전역 논리 좌표에 맞춥니다."""
+        cursor_position = QCursor.pos()
 
-    def _tick(self) -> None:
-        self._track_pointer()
-        if self.effects:
-            now = time.monotonic()
-            self.effects = [effect for effect in self.effects if not effect.expired(now)]
-            self.update()
+        target_x = cursor_position.x() - self.width() // 2
+        target_y = cursor_position.y() - self.height() // 2
 
-    def _track_pointer(self) -> None:
-        global_position = QCursor.pos()
-        local_position = global_position - self.geometry().topLeft()
-        if local_position == self.pointer:
-            return
-        previous = QPoint(self.pointer)
-        self.pointer = local_position
-        radius = self.spotlight.diameter // 2 + self.spotlight.border_width + 4
-        if previous.x() > -5000 and self.spotlight.enabled:
-            self.update(QRect(previous.x() - radius, previous.y() - radius, radius * 2, radius * 2))
-        if self.spotlight.enabled:
-            self.update(QRect(self.pointer.x() - radius, self.pointer.y() - radius, radius * 2, radius * 2))
+        if self.x() != target_x or self.y() != target_y:
+            self.move(target_x, target_y)
 
-    def _local_event_position(self, x: int, y: int) -> QPointF:
-        origin = self.geometry().topLeft()
-        return QPointF(x - origin.x(), y - origin.y())
-
-    def _append_effect(self, effect: Effect) -> None:
-        self.effects.append(effect)
-        if len(self.effects) > 3:
-            self.effects = self.effects[-3:]
-        self.total_effects += 1
-        self.effect_kind_counts[effect.kind] = self.effect_kind_counts.get(effect.kind, 0) + 1
-        self.max_active_effects = max(self.max_active_effects, len(self.effects))
-        self.update()
-
-    def add_click(self, x: int, y: int, button: str) -> None:
-        if not self.click.enabled or button not in {"left", "right"}:
-            return
-        color = QColor(
-            self.click.left_color if button == "left" else self.click.right_color
-        )
-        color.setAlpha(255)
-        self._append_effect(
-            Effect(
-                kind=f"click-{button}",
-                position=self._local_event_position(x, y),
-                started_at=time.monotonic(),
-                duration_ms=self.click.duration_ms,
-                start_diameter=self.spotlight.diameter * 0.65,
-                end_diameter=self.spotlight.diameter,
-                color=color,
-                line_width=5,
-            )
-        )
-
-    def add_wheel(self, x: int, y: int, delta: int) -> None:
-        if not self.wheel.enabled or delta == 0:
-            return
-        outward = delta > 0
-        outer_diameter = self.spotlight.diameter
-        inner_diameter = max(1, round(outer_diameter * 0.25))
-        color = QColor(self.wheel.color)
-        color.setAlpha(255)
-        self._append_effect(
-            Effect(
-                kind="wheel-out" if outward else "wheel-in",
-                position=self._local_event_position(x, y),
-                started_at=time.monotonic(),
-                duration_ms=self.wheel.duration_ms,
-                start_diameter=(
-                    inner_diameter if outward else outer_diameter
-                ),
-                end_diameter=(
-                    outer_diameter if outward else inner_diameter
-                ),
-                color=color,
-                line_width=self.wheel.line_width,
-            )
-        )
-
-    @staticmethod
-    def _circle_rect(position: QPointF, diameter: float) -> QRectF:
-        radius = diameter / 2
-        return QRectF(
-            QPointF(position.x() - radius, position.y() - radius),
-            QPointF(position.x() + radius, position.y() + radius),
-        )
-
-    def paintEvent(self, event) -> None:
+    def paintEvent(self, event: QPaintEvent) -> None:
+        """설정에 따라 채워진 원 또는 테두리 원을 그립니다."""
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        if self.spotlight.enabled:
-            color = QColor(self.spotlight.color)
-            color.setAlpha(round(255 * self.spotlight.opacity / 100))
-            if self.spotlight.style == "outline":
-                painter.setPen(QPen(color, self.spotlight.border_width))
-                painter.setBrush(Qt.NoBrush)
-            else:
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(color)
-            painter.drawEllipse(
-                self._circle_rect(QPointF(self.pointer), self.spotlight.diameter)
+
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+            rectangle = QRectF(
+                self.padding,
+                self.padding,
+                self.settings.diameter,
+                self.settings.diameter,
             )
 
-        now = time.monotonic()
-        painter.setBrush(Qt.NoBrush)
-        for effect in self.effects:
-            painter.setPen(QPen(effect.color, effect.line_width))
-            painter.drawEllipse(
-                self._circle_rect(effect.position, effect.diameter(now))
-            )
+            if self.settings.style == "fill":
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(self.highlight_color)
+            else:
+                pen = QPen(self.highlight_color)
+                pen.setWidthF(self.settings.line_width)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+
+                # 선은 경로 양쪽으로 그려지므로 두께의 절반만큼
+                # 경로를 안쪽으로 줄여 원의 바깥 지름을 유지합니다.
+                inset = self.settings.line_width / 2.0
+                rectangle.adjust(inset, inset, -inset, -inset)
+
+            painter.drawEllipse(rectangle)
+        finally:
+            painter.end()
