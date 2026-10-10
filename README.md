@@ -82,6 +82,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File packaging/build.ps1
 
 ## 문서
 
+- [실행파일 생성방법](<실행파일 생성방법.md>)
+- [배포파일 생성방법](<배포파일 생성방법.md>)
+
 - [HTML 사용자매뉴얼](docs/사용설명서.html)
 - [소스코드 설명서](docs/소스코드_설명서.md)
 - [검증보고서](docs/검증보고서.md)
